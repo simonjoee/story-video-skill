@@ -4,6 +4,8 @@
 
 A multi-agent pipeline implemented as an OpenCode Skill that converts short text into a complete narrated video. Five specialized agents collaborate in sequence: polish text, generate storyboard, create images, synthesize audio, and compose the final video.
 
+**Language scope:** This skill is designed primarily for Chinese text input. Narration audio is generated in Chinese. The prompts instruct the LLM to produce Chinese narration text and English scene descriptions (for image generation). Supporting other languages would require prompt and voice configuration changes — out of scope for v1.
+
 ## Decisions
 
 | Dimension | Decision |
@@ -62,7 +64,6 @@ story-video-skill/
 │   │       ├── SceneFrame.tsx       # Single frame: image + Ken Burns
 │   │       ├── Subtitles.tsx        # Subtitle overlay
 │   │       └── Transition.tsx       # Transition effects
-│   └── render.ts                   # CLI render script
 └── output/                         # Default output directory (gitignored)
 ```
 
@@ -117,6 +118,8 @@ class PolishedStory(BaseModel):
     target_duration_seconds: int  # Target video duration (estimated from word count)
 ```
 
+Duration estimation formula: `target_duration_seconds = len(full_text) / 250 * 60` (Chinese ~250 chars/minute speaking rate).
+
 ### schemas/storyboard.py — Storyboard Agent Output
 
 ```python
@@ -162,7 +165,7 @@ class VideoProject(BaseModel):
     storyboard: Storyboard
     media: MediaBundle
     output_path: str              # Final video output path
-    resolution: tuple[int, int]   # Default (1920, 1080)
+    resolution: list[int]          # [width, height], default [1920, 1080]
     fps: int                      # Default 30
 ```
 
@@ -229,6 +232,11 @@ providers:
     voice: alloy
     api_key_env: OPENAI_API_KEY
 
+pipeline:
+  max_concurrency: 3    # Max parallel requests for image/audio generation
+  retry_attempts: 3     # Retries per frame on failure
+  request_timeout: 60   # Seconds per provider API call
+
 output:
   dir: ./output
   resolution: [1920, 1080]
@@ -272,13 +280,16 @@ No agent code changes required.
 ### Agent Base Class — agents/base.py
 
 ```python
-class BaseAgent(ABC):
-    def __init__(self, config: dict, output_dir: str):
+TIn = TypeVar("TIn")
+TOut = TypeVar("TOut")
+
+class BaseAgent(ABC, Generic[TIn, TOut]):
+    def __init__(self, config: AppConfig, output_dir: str):
         self.config = config
         self.output_dir = output_dir
 
     @abstractmethod
-    async def run(self, input_data) -> Any: ...
+    async def run(self, input_data: TIn) -> TOut: ...
 
     def save_checkpoint(self, stage: str, data: BaseModel):
         """Save intermediate output to output/{stage}.json for resume support."""
@@ -293,6 +304,13 @@ class BaseAgent(ABC):
             return model_cls.model_validate_json(open(path).read())
         return None
 ```
+
+Each agent parameterizes `TIn` and `TOut`:
+- `PolishAgent(BaseAgent[str, PolishedStory])`
+- `StoryboardAgent(BaseAgent[PolishedStory, Storyboard])`
+- `ImageAgent(BaseAgent[Storyboard, list[ImageAsset]])`
+- `AudioAgent(BaseAgent[Storyboard, list[AudioAsset]])`
+- `ComposeAgent(BaseAgent[VideoProject, str])`
 
 ### 1. Polish Agent — polish_agent.py
 
@@ -388,7 +406,7 @@ Core logic:
 - Iterate `storyboard.frames`, call `AudioProvider.synthesize()` for each frame's `narration_text`
 - Concurrent generation (same as Image Agent)
 - Save to `output/audios/frame_{id}.mp3`
-- Read actual audio duration using `mutagen` or `pydub`
+- Read actual audio duration using `pydub` (chosen over `mutagen` for simpler API and broader format support)
 - Update `AudioAsset.duration_seconds` — this value overrides the estimated frame duration from storyboard
 
 ### 5. Compose Agent — compose_agent.py
@@ -403,20 +421,43 @@ Core logic:
 
 Core logic:
 1. Serialize `VideoProject` to JSON, write to `remotion/input-props.json`
-2. Call Remotion CLI:
+   - All file paths in `input-props.json` are **absolute paths** to avoid ambiguity
+2. Call Remotion CLI from the `remotion/` directory as working directory:
    ```bash
    npx remotion render src/index.ts StoryVideo \
      --props=./input-props.json \
-     --output=../output/final.mp4 \
+     --output={absolute_output_path}/final.mp4 \
      --codec=h264
    ```
 3. Wait for render completion, return video path
 
+### Configuration Schema — schemas/config.py
+
+```python
+class ProviderConfig(BaseModel):
+    type: str
+    model: str
+    api_key_env: str
+    # Provider-specific fields passed through
+    extra: dict = {}
+
+class AppConfig(BaseModel):
+    providers: dict[str, ProviderConfig]  # keyed by "llm", "image", "audio"
+    output: OutputConfig
+
+class OutputConfig(BaseModel):
+    dir: str = "./output"
+    resolution: list[int] = [1920, 1080]
+    fps: int = 30
+```
+
+Config is loaded from `config.yaml` and validated as `AppConfig` at startup, before any agent runs.
+
 ### Orchestrator — orchestrator.py
 
 ```python
-async def run_pipeline(input_text: str, config: dict):
-    output_dir = config["output"]["dir"]
+async def run_pipeline(input_text: str, config: AppConfig):
+    output_dir = config.output.dir
 
     # 1. Polish
     story = await PolishAgent(config, output_dir).run(input_text)
@@ -437,12 +478,35 @@ async def run_pipeline(input_text: str, config: dict):
         storyboard=storyboard,
         media=MediaBundle(images=images, audios=audios),
         output_path=os.path.join(output_dir, "final.mp4"),
-        resolution=tuple(config["output"]["resolution"]),
-        fps=config["output"]["fps"],
+        resolution=config.output.resolution,
+        fps=config.output.fps,
     )
     video_path = await ComposeAgent(config, output_dir).run(project)
 
     return video_path
+```
+
+### CLI Entry Point
+
+```python
+# orchestrator.py __main__ block
+if __name__ == "__main__":
+    import argparse, yaml
+
+    parser = argparse.ArgumentParser(description="Story Video Pipeline")
+    parser.add_argument("text", help="Input text or path to text file")
+    parser.add_argument("--config", default="config.yaml", help="Config file path")
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
+    args = parser.parse_args()
+
+    # Load text from file if path provided, otherwise use as literal text
+    input_text = open(args.text).read() if os.path.isfile(args.text) else args.text
+
+    # Load and validate config
+    with open(args.config) as f:
+        config = AppConfig.model_validate(yaml.safe_load(f))
+
+    asyncio.run(run_pipeline(input_text, config))
 ```
 
 ## Remotion Integration
@@ -461,8 +525,7 @@ remotion/
 │       ├── SceneFrame.tsx     # Single frame: image + Ken Burns pan/zoom
 │       ├── Subtitles.tsx      # Subtitle overlay layer
 │       └── Transition.tsx     # Transition effects (fade/dissolve/cut)
-├── input-props.json           # Generated by Python, passed at render time
-└── render.ts                  # CLI render entry script
+└── input-props.json           # Generated by Python, passed at render time
 ```
 
 ### Data Transfer: Python → Remotion
@@ -477,8 +540,8 @@ Compose Agent serializes `VideoProject` into `input-props.json`:
   "frames": [
     {
       "frameId": 1,
-      "imagePath": "../output/images/frame_1.png",
-      "audioPath": "../output/audios/frame_1.mp3",
+      "imagePath": "/absolute/path/to/output/images/frame_1.png",
+      "audioPath": "/absolute/path/to/output/audios/frame_1.mp3",
       "durationSeconds": 8.2,
       "narrationText": "在一个宁静的小镇上...",
       "transition": "fade"
@@ -486,6 +549,8 @@ Compose Agent serializes `VideoProject` into `input-props.json`:
   ]
 }
 ```
+
+All media file paths are **absolute** to avoid working-directory ambiguity between Python and Remotion.
 
 ### Core Components
 
@@ -504,15 +569,17 @@ Three modes: cut (instant switch), fade (fade out + fade in), dissolve (cross-di
 ### Render Process
 
 ```
-1. Python writes input-props.json
-2. subprocess call:
-   npx remotion render remotion/src/index.ts StoryVideo \
-     --props=remotion/input-props.json \
-     --output=output/final.mp4 \
+1. Python writes remotion/input-props.json (all media paths are absolute)
+2. subprocess call (cwd=remotion/):
+   npx remotion render src/index.ts StoryVideo \
+     --props=./input-props.json \
+     --output={absolute_path}/output/final.mp4 \
      --codec=h264
 3. Remotion reads props → assembles frames on timeline → encodes to MP4
 4. Python checks output/final.mp4 exists → returns path
 ```
+
+Note: `render.ts` is removed from the design — the direct `npx remotion render` CLI invocation is sufficient. No custom render script needed.
 
 ### Dependencies
 
@@ -543,7 +610,7 @@ description: Use when the user wants to generate a video from text, a short stor
 ### Content Structure
 
 1. **Overview** — One-line description: multi-agent pipeline that converts text to video
-2. **Prerequisites** — Python 3.11+, Node.js 18+, Chromium, API keys
+2. **Prerequisites** — Python 3.11+, Node.js 18+, Chrome/Chromium (for Remotion rendering), pydub + ffmpeg (for audio duration), API keys for configured providers
 3. **Quick Start** — Configure config.yaml, install dependencies, run orchestrator
 4. **Pipeline Stages** — Brief description of 5 agents and execution order
 5. **Configuration** — config.yaml field reference
@@ -579,4 +646,64 @@ Progress output at each stage:
 [5/5] Done! → output/final.mp4 (1m36s, 48MB)
 ```
 
-On failure, checkpoints are saved. Next run auto-resumes from the last successful stage.
+On failure, checkpoints are saved. Next run with `--resume` auto-resumes from the last successful stage.
+
+## Error Handling
+
+### Per-frame Failure in Parallel Stages (Image/Audio)
+
+Image and audio generation use `asyncio.Semaphore` to limit concurrency (default: 3 concurrent requests, configurable). When a single frame fails:
+
+1. **Retry** — Each frame generation retries up to 3 times with exponential backoff (1s, 2s, 4s)
+2. **Fail the stage** — If retries are exhausted for any frame, the entire stage (image or audio) fails
+3. **Checkpoint partial progress** — Successfully generated frames are already saved to disk individually. On the next `--resume` run, existing files are skipped
+
+No partial video is generated — both image and audio stages must complete fully before compose begins.
+
+### Provider API Errors
+
+| Error | Handling |
+|-------|----------|
+| Auth failure (401/403) | Fail immediately with clear message: "API key invalid or missing for {provider}" |
+| Rate limit (429) | Retry with exponential backoff, respect `Retry-After` header if present |
+| Network error | Retry up to 3 times |
+| Timeout | 60s default timeout per request, retry on timeout |
+| Invalid response | Fail the frame, enter retry loop |
+
+### Checkpoint Resume Logic
+
+The orchestrator checks for existing checkpoints at each stage start:
+
+```
+1. output/polish.json exists?       → skip polish, load PolishedStory
+2. output/storyboard.json exists?   → skip storyboard, load Storyboard
+3. output/images/ has all frames?   → skip image generation (partial = generate missing only)
+4. output/audios/ has all frames?   → skip audio generation (partial = generate missing only)
+5. output/final.mp4 exists?         → skip compose, return path
+```
+
+Resume is triggered by `--resume` flag. Without it, `output/` is cleared and pipeline runs from scratch.
+
+## Testing Strategy
+
+### Unit Testing (with Mock Providers)
+
+Each agent can be tested independently by injecting mock providers:
+
+- **Mock LLMProvider** — returns predefined JSON strings
+- **Mock ImageProvider** — returns a 1x1 pixel PNG
+- **Mock AudioProvider** — returns a short silent MP3
+
+Test each agent's input parsing, output schema validation, and checkpoint save/load.
+
+### Integration Testing
+
+Run the full pipeline with mock providers to verify:
+- Data flows correctly between stages
+- Parallel execution works
+- Checkpoint resume works
+- Remotion receives valid input-props.json
+
+### Remotion Testing
+
+Use Remotion's `npx remotion preview` for visual verification during development. Test with a small number of frames (2-3) to keep render time short.
