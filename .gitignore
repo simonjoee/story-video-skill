@@ -1,0 +1,7 @@
+output/
+__pycache__/
+*.pyc
+.env
+remotion/node_modules/
+remotion/dist/
+remotion/input-props.json
